@@ -29,9 +29,18 @@ class TaskState(StrEnum):
     FAILED = "failed"
 
 
+class Priority(StrEnum):
+    NORMAL = "normal"
+    URGENT = "urgent"
+
+
 class StartTaskRequest(BaseModel):
     station: str = Field(..., examples=["54511"])
     date: str = Field(..., examples=["2026-11-17"])
+    priority: Priority = Field(
+        default=Priority.NORMAL,
+        description="Scheduling priority; urgent tasks preempt a running normal task.",
+    )
 
     @field_validator("station")
     @classmethod
@@ -78,6 +87,8 @@ class TaskView(BaseModel):
     station: str
     date: str
     state: TaskState
+    priority: Priority = Priority.NORMAL
+    queued_reason: str | None = None
     source_url: str | None = None
     source_revision: str | None = None
     source_etag: str | None = None

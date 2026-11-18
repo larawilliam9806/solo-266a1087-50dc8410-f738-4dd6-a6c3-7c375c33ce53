@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     station TEXT NOT NULL,
     date TEXT NOT NULL,
     state TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'normal',
+    queued_reason TEXT,
     source_url TEXT,
     source_revision TEXT,
     source_etag TEXT,
@@ -44,6 +46,13 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, seq);
 """
 
+# Columns added after the initial release; applied idempotently so an older
+# SQLite volume from an earlier image version keeps working across upgrades.
+MIGRATIONS = (
+    ("priority", "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+    ("queued_reason", "ALTER TABLE tasks ADD COLUMN queued_reason TEXT"),
+)
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -64,6 +73,13 @@ class Store:
         with self.connection() as conn:
             conn.executescript(SCHEMA)
             conn.execute("PRAGMA journal_mode=WAL")
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        for column, statement in MIGRATIONS:
+            if column not in existing:
+                conn.execute(statement)
 
     def connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -114,16 +130,44 @@ class Store:
             .fetchall()
         )
 
+    def list_queued_ordered(self) -> list[sqlite3.Row]:
+        """Queue order: urgent first (FIFO within a priority), then normal."""
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM tasks WHERE state='queued' "
+                "ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, created_at"
+            )
+            .fetchall()
+        )
+
     # -- mutations -------------------------------------------------------
-    def insert_task(self, task_id: str, station: str, date: str) -> None:
+    def insert_task(self, task_id: str, station: str, date: str, priority: str = "normal") -> None:
         now = utcnow()
         with self.transaction() as conn:
             conn.execute(
-                "INSERT INTO tasks (id, station, date, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'queued', ?, ?)",
-                (task_id, station, date, now, now),
+                "INSERT INTO tasks (id, station, date, state, priority, queued_reason, "
+                "created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)",
+                (
+                    task_id,
+                    station,
+                    date,
+                    priority,
+                    "queued: waiting for an available transfer slot",
+                    now,
+                    now,
+                ),
             )
-            self._event(conn, task_id, "queued", f"{station}/{date}", now)
+            self._event(conn, task_id, "queued", f"{station}/{date} priority={priority}", now)
+
+    def set_queued_reason(self, task_id: str, reason: str | None) -> bool:
+        """Update the human-readable queue reason without touching state."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET queued_reason=?, updated_at=? WHERE id=?",
+                (reason, utcnow(), task_id),
+            )
+            return cur.rowcount == 1
 
     def update(self, task_id: str, **fields: Any) -> bool:
         if not fields:

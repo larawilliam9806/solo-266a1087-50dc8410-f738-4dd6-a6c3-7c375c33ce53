@@ -4,8 +4,10 @@
 Usage:
     python scripts/demo.py [--source http://localhost:9000] [--api http://localhost:8000]
 
-The demo collects one archive, pauses/resumes it, switches the source revision,
-refreshes and verifies the downloadable package's size and SHA-256.
+The demo starts a background (normal) collection, shows an urgent QC task
+preempting it with partial fragments retained, watches the normal task resume
+automatically, then exercises pause/resume, a revision switch with refresh, and
+verifies the downloadable package's size and SHA-256.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import time
 import httpx
 
 
-def wait(client: httpx.Client, api: str, task_id: str, states: set[str], timeout: float = 60) -> dict:
+def wait(client: httpx.Client, api: str, task_id: str, states: set[str], timeout: float = 90) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         view = client.get(f"{api}/tasks/{task_id}").json()
@@ -26,6 +28,17 @@ def wait(client: httpx.Client, api: str, task_id: str, states: set[str], timeout
             return view
         time.sleep(0.2)
     raise SystemExit(f"timeout waiting for {states}; last={view}")
+
+
+def wait_until(client: httpx.Client, api: str, task_id: str, predicate, timeout: float = 30) -> dict:
+    deadline = time.monotonic() + timeout
+    view = {}
+    while time.monotonic() < deadline:
+        view = client.get(f"{api}/tasks/{task_id}").json()
+        if predicate(view):
+            return view
+        time.sleep(0.1)
+    raise SystemExit(f"predicate not met; last={view}")
 
 
 def main() -> int:
@@ -43,60 +56,78 @@ def main() -> int:
         client.post(f"{source}/admin/reset")
         client.post(f"{source}/admin/delay", json={"seconds": 0.3, "chunk_seconds": 0.01})
 
-        task = client.post(
-            f"{api}/tasks", json={"station": args.station, "date": args.date}
+        # 1) Background, normal-priority re-collection occupies the single slot.
+        normal = client.post(
+            f"{api}/tasks",
+            json={"station": args.station, "date": args.date, "priority": "normal"},
         ).json()
-        task_id = task["id"]
-        print("task:", task_id, task["state"])
+        normal_id = normal["id"]
+        print("normal task:", normal_id, normal["priority"], normal["state"])
+        client.post(f"{api}/tasks/{normal_id}/start")
+        wait_until(client, api, normal_id, lambda v: v["downloaded_bytes"] > 0)
+        view = client.get(f"{api}/tasks/{normal_id}").json()
+        print("normal downloading:", view["state"], view["downloaded_bytes"], "bytes")
 
-        started = client.post(f"{api}/tasks/{task_id}/start").json()
-        print("start:", started["state"])
+        # 2) An urgent QC request arrives and preempts the normal transfer.
+        urgent = client.post(
+            f"{api}/tasks",
+            json={"station": "54512", "date": args.date, "priority": "urgent"},
+        ).json()
+        urgent_id = urgent["id"]
+        client.post(f"{api}/tasks/{urgent_id}/start")
+        wait_until(client, api, urgent_id, lambda v: v["state"] == "running")
+        preempted = wait_until(client, api, normal_id, lambda v: v["state"] == "queued")
+        print("urgent task running:", urgent_id)
+        print("normal preempted:", preempted["queued_reason"])
+        print("scheduler:", client.get(f"{api}/scheduler").json()["queue_position"])
 
-        # Let some bytes land, then pause.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            view = client.get(f"{api}/tasks/{task_id}").json()
-            if view["downloaded_bytes"] > 0:
-                break
-            time.sleep(0.05)
-        paused = client.post(f"{api}/tasks/{task_id}/pause").json()
-        print("pause:", paused["state"], "bytes:", paused["downloaded_bytes"])
-        time.sleep(0.5)
-        after = client.get(f"{api}/tasks/{task_id}").json()
-        assert after["state"] == "paused", after
-        assert after["downloaded_bytes"] >= paused["downloaded_bytes"]
-        print("stable while paused:", after["state"], after["downloaded_bytes"])
+        urgent_done = wait(client, api, urgent_id, {"completed", "failed"})
+        assert urgent_done["state"] == "completed", urgent_done
+        print("urgent finished first:", urgent_done["verified_sha256"][:12])
 
-        resumed = client.post(f"{api}/tasks/{task_id}/resume").json()
-        print("resume:", resumed["state"])
-        done = wait(client, api, task_id, {"completed", "failed"}, timeout=90)
-        print("finished:", done["state"], done["percent"], done["verified_sha256"])
-        if done["state"] != "completed":
-            print("error:", done["error"])
-            return 1
-
-        package = client.get(f"{api}/tasks/{task_id}/package")
+        # 3) The normal task resumes automatically from its retained fragments.
+        resumed = wait_until(client, api, normal_id, lambda v: v["state"] == "running")
+        print("normal auto-resumed, generation now:", resumed["generation"])
+        done = wait(client, api, normal_id, {"completed", "failed"})
+        assert done["state"] == "completed", done
+        package = client.get(f"{api}/tasks/{normal_id}/package")
         package.raise_for_status()
         digest = hashlib.sha256(package.content).hexdigest()
         assert digest == done["verified_sha256"], (digest, done["verified_sha256"])
-        assert len(package.content) == done["verified_size"]
-        print(f"package downloaded: {len(package.content)} bytes, sha256 verified")
+        print(f"normal package verified: {len(package.content)} bytes")
 
-        # Switch the source revision and refresh: old package must be replaced.
+        # 4) Manual pause is respected (never auto-resumed) until an explicit resume.
+        client.post(f"{source}/admin/delay", json={"seconds": 0.0, "chunk_seconds": 0.02})
+        manual = client.post(
+            f"{api}/tasks", json={"station": "54513", "date": args.date}
+        ).json()
+        client.post(f"{api}/tasks/{manual['id']}/start")
+        wait_until(client, api, manual["id"], lambda v: v["downloaded_bytes"] > 0)
+        paused = client.post(f"{api}/tasks/{manual['id']}/pause").json()
+        print("manual pause:", paused["state"], "bytes:", paused["downloaded_bytes"])
+        time.sleep(0.5)
+        after = client.get(f"{api}/tasks/{manual['id']}").json()
+        assert after["state"] == "paused", after
+        client.post(f"{api}/tasks/{manual['id']}/resume")
+        manual_done = wait(client, api, manual["id"], {"completed", "failed"})
+        assert manual_done["state"] == "completed"
+
+        # 5) Switch the source revision and refresh: old package is replaced.
+        client.post(f"{source}/admin/delay", json={"seconds": 0.0, "chunk_seconds": 0.0})
         client.post(
             f"{source}/admin/revision",
             json={"station": args.station, "date": args.date, "revision": "v2"},
         )
-        client.post(f"{api}/tasks/{task_id}/refresh")
-        done2 = wait(client, api, task_id, {"completed", "failed"}, timeout=90)
+        client.post(f"{api}/tasks/{normal_id}/refresh")
+        done2 = wait(client, api, normal_id, {"completed", "failed"}, timeout=90)
         assert done2["state"] == "completed", done2
         assert done2["source_revision"] == "v2", done2
         assert done2["verified_sha256"] != done["verified_sha256"]
-        package2 = client.get(f"{api}/tasks/{task_id}/package")
+        package2 = client.get(f"{api}/tasks/{normal_id}/package")
         package2.raise_for_status()
         assert hashlib.sha256(package2.content).hexdigest() == done2["verified_sha256"]
         print("revision switch verified:", done2["source_revision"], done2["verified_sha256"][:12])
-        print("events:", [e["event"] for e in client.get(f"{api}/tasks/{task_id}/events").json()])
+        print("events:", [e["event"] for e in client.get(f"{api}/tasks/{normal_id}/events").json()])
     return 0
 
 

@@ -31,6 +31,8 @@ def _view(row, base_url: str, package_ok: bool) -> TaskView:
         station=row["station"],
         date=row["date"],
         state=TaskState(row["state"]),
+        priority=row["priority"],
+        queued_reason=row["queued_reason"],
         source_url=row["source_url"],
         source_revision=row["source_revision"],
         source_etag=row["source_etag"],
@@ -82,10 +84,15 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
             raise HTTPException(404, detail="task not found")
 
     def package_ready(row) -> bool:
+        """A package is servable when a verified file exists on disk.
+
+        Deliberately independent of task state: a refresh waiting in the queue
+        keeps its previously verified package downloadable until the new
+        transfer starts and invalidates the verification columns.
+        """
         path = row["package_path"]
         return bool(
-            row["state"] == "completed"
-            and path
+            path
             and Path(path).is_file()
             and row["verified_size"] == row["expected_size"] is not None
             and row["verified_sha256"] == row["expected_sha256"]
@@ -113,7 +120,9 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
         if existing is not None:
             return view(existing, request)
         try:
-            collector.create_task(uuid.uuid4().hex, body.station, body.date)
+            collector.create_task(
+                uuid.uuid4().hex, body.station, body.date, body.priority.value
+            )
         except sqlite3.IntegrityError:
             # A concurrent request created the same station/date first.
             existing = collector.store.find(body.station, body.date)
@@ -139,7 +148,7 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
     async def start_task(task_id: str, request: Request):
         row_or_404(task_id)
         result = await collector.start(task_id)
-        if result["state"] not in {"running", "completed"}:
+        if result["state"] not in {"running", "completed", "queued"}:
             raise conflict(result, "start")
         return view(collector.store.get(task_id), request)
 
@@ -155,7 +164,7 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
     async def resume_task(task_id: str, request: Request):
         row_or_404(task_id)
         result = await collector.start(task_id)
-        if result["state"] not in {"running", "completed"}:
+        if result["state"] not in {"running", "completed", "queued"}:
             raise conflict(result, "resume")
         return view(collector.store.get(task_id), request)
 
@@ -163,7 +172,7 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
     async def refresh_task(task_id: str, request: Request):
         row_or_404(task_id)
         result = await collector.refresh(task_id)
-        if result["state"] not in {"running", "completed"}:
+        if result["state"] not in {"running", "completed", "queued"}:
             raise conflict(result, "refresh")
         return view(collector.store.get(task_id), request)
 
@@ -181,10 +190,19 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
     )
     async def download_package(task_id: str):
         row = row_or_404(task_id)
-        if row["state"] != "completed":
-            raise HTTPException(409, detail=f"task is {row['state']}; no package available")
+        # A refresh that is still queued keeps its previously verified package
+        # exposed; the verification columns are only invalidated once the new
+        # transfer actually starts.  Everything else without a verified package
+        # is refused.
         if not package_ready(row):
-            raise HTTPException(409, detail="package missing or failed verification")
+            raise HTTPException(
+                409,
+                detail=(
+                    f"task is {row['state']}; no verified package available"
+                    if row["state"] != "completed"
+                    else "package missing or failed verification"
+                ),
+            )
         if not Path(row["package_path"]).is_file():
             raise HTTPException(409, detail="package file is gone; refresh the task")
         filename = f"{row['station']}-{row['date']}.tar.gz"
@@ -198,6 +216,37 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
             },
         )
 
+    @app.get("/scheduler")
+    async def scheduler_overview(request: Request):
+        """Single-slot scheduler view: who runs now and who waits, and why."""
+        queued = [
+            {
+                "id": row["id"],
+                "station": row["station"],
+                "date": row["date"],
+                "priority": row["priority"],
+                "queued_reason": row["queued_reason"],
+            }
+            for row in collector.store.list_queued_ordered()
+        ]
+        running = [
+            {
+                "id": row["id"],
+                "station": row["station"],
+                "date": row["date"],
+                "priority": row["priority"],
+                "downloaded_bytes": row["downloaded_bytes"],
+                "percent": _view(row, str(request.base_url).rstrip("/"), False).percent,
+            }
+            for row in collector.store.list("running")
+        ]
+        return {
+            "max_concurrent_tasks": 1,
+            "running": running,
+            "queue_position": queued,
+            "next_task_id": queued[0]["id"] if queued else None,
+        }
+
     @app.get("/")
     async def index(request: Request):
         base = str(request.base_url).rstrip("/")
@@ -206,8 +255,14 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
             "version": __version__,
             "source": settings.source_base_url,
             "demo": f"{base}/docs#/default/create_task_tasks_post",
+            "scheduling": {
+                "priorities": ["normal", "urgent"],
+                "default_priority": "normal",
+                "max_concurrent_tasks": 1,
+                "preemption": "urgent pauses a running normal task; fragments retained, resumed automatically",
+            },
             "endpoints": [
-                "POST /tasks {station,date}",
+                "POST /tasks {station,date,priority?}",
                 "GET /tasks",
                 "GET /tasks/{id}",
                 "POST /tasks/{id}/start",
@@ -216,6 +271,7 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
                 "POST /tasks/{id}/refresh",
                 "GET /tasks/{id}/events",
                 "GET /tasks/{id}/package",
+                "GET /scheduler",
             ],
         }
 
